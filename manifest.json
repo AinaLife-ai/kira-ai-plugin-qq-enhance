@@ -1,7 +1,7 @@
 {
     "display_name": "QQ增强",
     "plugin_id": "kira-ai-plugin-qq-enhance",
-    "version": "1.4.5",
+    "version": "1.4.6",
     "author": "KiraAI",
     "icon": "icon.svg",
     "tags": ["tools", "chat"],

@@ -2,13 +2,252 @@ import asyncio
 import json
 import random
 import re
+import xml.etree.ElementTree as ET
 from core.plugin import BasePlugin, PluginContext, logger, on, Priority, register
 from core.chat.message_utils import KiraMessageBatchEvent, KiraMessageEvent
 from core.chat.message_elements import Text, Sticker, Reply
 from core.chat import MessageChain, Session
+from core.tag import tag_registry
 from core.provider import LLMRequest, LLMResponse
 from core.utils.tool_utils import BaseTool
 
+
+# ==================== 表情控制（XML 层改写） ====================
+# 框架的 add_message_ids() 是按「原始 XML 中第 i 个 <msg>」回填「第 i 条发送结果」的
+# message_id。任何在发送前增删、拆分、重排消息块的做法都会让这个对应关系错位，
+# 于是回写的 message_id 贴到了错误的消息上，之后模型再引用/撤回/贴表情就会指错目标。
+# 这里改为直接改写 XML 本身，让 <msg> 序列与实际发送序列严格一一对应。
+_STICKER_MSG = "msg"
+_STICKER_TAG = "sticker"
+_STICKER_REPLY = "reply"
+_STICKER_TEXT = "text"
+# 消息全部被过滤掉时用它表示「这一轮不发送任何消息」，与提示词里 <msg/> 的语义一致
+_STICKER_EMPTY_TURN = ""
+
+
+def _sticker_is_blank_text(node) -> bool:
+    """<text></text>、<text>   </text> 解析后不会产生任何消息元素。"""
+    return node.tag == _STICKER_TEXT and not (node.text or "").strip()
+
+
+def _sticker_effective_children(msg) -> list:
+    """剔除解析后不产生元素的空白 <text>，得到真正会变成消息元素的子节点。"""
+    return [n for n in msg if not _sticker_is_blank_text(n)]
+
+
+def _sticker_produces_element(node, sticker_enabled, valid_sticker_ids) -> bool:
+    """该子节点解析后是否真的会变成一个消息元素。
+
+    <text> 空白时不产出；<sticker> 在标签未注册、或 id 不在表情库里时同样不产出
+    （内置 StickerTag 对未知 id 返回空列表）。其余标签一律按会产出处理。
+    """
+    if node.tag == _STICKER_TEXT:
+        return bool((node.text or "").strip())
+    if node.tag == _STICKER_TAG:
+        if not sticker_enabled:
+            return False
+        if valid_sticker_ids is None:
+            return True
+        return (node.text or "").strip() in valid_sticker_ids
+    return True
+
+
+def _sticker_live_children(msg, sticker_enabled, valid_sticker_ids) -> list:
+    """真正会产出消息元素的子节点（用于判断这条消息发出去还有没有东西）。"""
+    return [n for n in msg
+            if _sticker_produces_element(n, sticker_enabled, valid_sticker_ids)]
+
+
+def _sticker_detach(parent, child) -> None:
+    """从 parent 摘下 child，并把它的 tail 并回前一个兄弟，避免文本/空白错位。"""
+    children = list(parent)
+    idx = children.index(child)
+    tail = child.tail or ""
+    parent.remove(child)
+    if idx > 0:
+        prev = children[idx - 1]
+        prev.tail = (prev.tail or "") + tail
+    else:
+        parent.text = (parent.text or "") + tail
+
+
+def _sticker_detach_from_root(root, node) -> int:
+    """从 root 摘下 node，返回它原来的下标。"""
+    children = list(root)
+    idx = children.index(node)
+    tail = node.tail or ""
+    root.remove(node)
+    if idx > 0:
+        children[idx - 1].tail = (children[idx - 1].tail or "") + tail
+    else:
+        root.text = (root.text or "") + tail
+    return idx
+
+
+def _sticker_make_msg(node):
+    """把一个表情元素包装成独立的消息块。"""
+    msg = ET.Element(_STICKER_MSG)
+    msg.append(node)
+    msg.tail = "\n"
+    return msg
+
+
+def _sticker_is_sticker_only(node) -> bool:
+    return node.tag == _STICKER_MSG and [n.tag for n in node] == [_STICKER_TAG]
+
+
+def _sticker_signature(root) -> list:
+    """整棵树的可比较签名，用于改写后的语义自检。"""
+    return [
+        (node.tag, tuple(sorted(node.attrib.items())),
+         tuple((c.tag, tuple(sorted(c.attrib.items())), (c.text or "").strip()) for c in node))
+        for node in root
+    ]
+
+
+def _sticker_shuffle(root, rng) -> None:
+    """在「根标签分隔出的片段」内重排表情消息，绝不跨过根标签。
+
+    根标签（如 <mute/>）代表一个动作，表情不能改变它的相对执行位置。
+    """
+    segments = []
+    segment = []
+    for node in list(root):
+        if node.tag == _STICKER_MSG:
+            segment.append(node)
+        else:
+            if segment:
+                segments.append(segment)
+                segment = []
+    if segment:
+        segments.append(segment)
+
+    for seg in segments:
+        stickers = [n for n in seg if _sticker_is_sticker_only(n)]
+        if not stickers:
+            continue
+        others = [n for n in seg if not _sticker_is_sticker_only(n)]
+        anchor = list(root).index(seg[0])
+        for node in seg:
+            root.remove(node)
+        pool = others[:]
+        for sc in stickers:
+            pool.insert(rng.randint(0, len(pool)), sc)
+        for offset, node in enumerate(pool):
+            root.insert(anchor + offset, node)
+
+
+def _sticker_rewrite_xml(xml_data, probability, random_position, rng=None,
+                         sticker_enabled=True, valid_sticker_ids=None):
+    """把 <sticker> 拆成独立消息块、丢弃空引用消息，并按需重排位置。
+
+    sticker_enabled: sticker 标签本轮是否已注册。未注册时该标签解析不出任何元素，
+        不能拆（否则会凭空多出一条空消息，反而破坏 message_id 对齐）。
+    valid_sticker_ids: 当前可用的 sticker id 集合。标签遇到未知 id 会返回空列表，
+        先把这些节点摘掉，避免同一问题。
+
+    返回改写后的 XML；无需改写或无法安全改写时返回 None，调用方必须保持原文。
+    """
+    if not isinstance(xml_data, str) or not xml_data or _STICKER_MSG not in xml_data:
+        return None
+    try:
+        root = ET.fromstring(f"<root>{xml_data}</root>")
+    except ET.ParseError:
+        # 交给框架自己的 XML 修复流程，这里绝不碰原文
+        return None
+
+    rng = rng or random
+    changed = False
+
+    for msg in list(root):
+        if msg.tag != _STICKER_MSG or not list(msg):
+            # 空的 <msg/> 是「不发消息」的语义，留到最后统一处理
+            continue
+
+        # 解析不出元素的表情先摘掉，否则它会把消息撑成「还有内容」
+        if valid_sticker_ids is not None:
+            for node in [n for n in msg if n.tag == _STICKER_TAG]:
+                if (node.text or "").strip() not in valid_sticker_ids:
+                    _sticker_detach(msg, node)
+                    changed = True
+
+        stickers = [n for n in msg if n.tag == _STICKER_TAG] if sticker_enabled else []
+        removed = False
+
+        if stickers:
+            # 按概率决定哪些表情保留
+            kept = [n for n in stickers if rng.random() < probability]
+            rest = [n for n in _sticker_effective_children(msg) if n.tag != _STICKER_TAG]
+
+            # 单表情、被保留、且没有其他内容：本来就是独立一条，无需改动
+            if not (len(stickers) == 1 and kept and not rest):
+                changed = True
+                # 原链中移除所有表情（无论是否保留）
+                for node in stickers:
+                    _sticker_detach(msg, node)
+
+                if not rest:
+                    # 纯表情：原消息不再产生任何元素，保留的表情各自独立成条
+                    insert_at = _sticker_detach_from_root(root, msg)
+                    removed = True
+                else:
+                    # 还有正文：正文留在原消息，保留的表情紧跟其后独立成条
+                    insert_at = list(root).index(msg) + 1
+                    # 去掉表情后只剩一个 <reply> 的「空引用」整条丢弃
+                    if len(rest) == 1 and rest[0].tag == _STICKER_REPLY:
+                        insert_at = _sticker_detach_from_root(root, msg)
+                        removed = True
+
+                for node in kept:
+                    root.insert(insert_at, _sticker_make_msg(node))
+                    insert_at += 1
+
+        # 只包含一个 <reply> 的「空引用」消息块整条丢弃（与原有行为一致）。
+        # 判定用「真正会产出元素」的子节点：未注册或 id 无效的 <sticker> 不产出任何
+        # 东西，不能让它把空引用撑成「有内容」，否则会发出一个只有引用的空气泡。
+        if not removed:
+            rest = _sticker_live_children(msg, sticker_enabled, valid_sticker_ids)
+            if len(rest) == 1 and rest[0].tag == _STICKER_REPLY:
+                _sticker_detach_from_root(root, msg)
+                changed = True
+
+    if not changed:
+        return None
+
+    # 清理解析后不会产生任何消息元素的消息块（空 <msg/>、只剩空白 <text> 的、
+    # 表情被摘光又没有其他内容的）。它们若不删掉，XML 的 <msg> 数就会多于实际发送
+    # 条数，message_id 依然会错位。
+    for msg in list(root):
+        if msg.tag == _STICKER_MSG and not _sticker_live_children(
+                msg, sticker_enabled, valid_sticker_ids):
+            _sticker_detach_from_root(root, msg)
+
+    if random_position:
+        _sticker_shuffle(root, rng)
+
+    # 消息全被过滤掉、且没有根标签（动作）要执行时，返回空响应。
+    # 保持空字符串而不是 <msg/>：既不会发送任何气泡，也不会被其他插件的
+    # 「空消息即停止」判定误认为本轮是主动静默结束。
+    if not [n for n in root if n.tag == _STICKER_MSG]:
+        leftovers = [n for n in root if n.tag != _STICKER_MSG]
+        if not leftovers:
+            return _STICKER_EMPTY_TURN
+
+    expected = _sticker_signature(root)
+    body = ET.tostring(root, encoding="unicode", method="xml")[6:-7]
+
+    # 序列化保真自检：重新解析后语义必须与内存中的树一致，否则放弃改写
+    try:
+        check = ET.fromstring(f"<root>{body}</root>")
+    except ET.ParseError:
+        return None
+    if _sticker_signature(check) != expected:
+        return None
+
+    return body
+
+
+# ==================== 表情控制（XML 层改写）结束 ====================
 
 # ==================== 原有工具类（贴表情、点赞、撤回、禁言） ====================
 class SetEmojiTool(BaseTool):
@@ -208,7 +447,7 @@ class QQEnhancePlugin(BasePlugin):
 
         # ----- Sticker Control 配置 -----
         self.sticker_control_enabled = self.plugin_cfg.get("sticker_control_enabled", False)
-        self.sticker_probability = float(self.plugin_cfg.get("sticker_probability", 0.5))
+        self.sticker_probability = float(self.plugin_cfg.get("sticker_probability", 1.0))
         self.random_position = bool(self.plugin_cfg.get("random_position", True))
 
         # ----- Typing Indicator 配置 -----
@@ -349,76 +588,49 @@ class QQEnhancePlugin(BasePlugin):
             req.tool_set.add(SendMusicCardTool(ctx=self.ctx))
 
     # ---------- Sticker Control 功能 ----------
-    @on.after_xml_parse(priority=Priority.HIGH)
-    async def process_stickers(self, event: KiraMessageBatchEvent, message_chains: list):
+    # 说明：表情的拆分/丢弃/重排必须在 XML 阶段完成。
+    # 框架的 add_message_ids() 按「原始 XML 中第 i 个 <msg>」回填「第 i 条发送结果」的
+    # message_id；若在 after_xml_parse 里增删或重排消息块，这个一一对应关系就被破坏，
+    # 回写的 message_id 会贴到错误的消息上，之后引用/撤回/贴表情都会指向错误目标。
+    # 因此这里改为在 llm_response 阶段直接改写 XML，让 <msg> 序列与实际发送序列保持一致。
+    @on.llm_request(priority=Priority.LOW)
+    async def remember_sticker_tag(self, event: KiraMessageBatchEvent, _req, tag_set):
+        # sticker 标签未注册时（内置表情插件被关掉等）它解析不出任何元素，
+        # 这时不能把 <sticker> 拆成独立消息，否则会凭空多出一条空消息。
+        # 注意时机：框架是在所有 llm_request 处理器跑完之后，才把插件用
+        # @register.tag 声明的标签补进 tag_set，所以这里还要看一眼全局注册表，
+        # 否则装饰器注册的 sticker 标签会被误判为未注册，导致功能静默失效。
+        ready = "sticker" in tag_set or "sticker" in tag_registry
+        setattr(event, "_sticker_tag_ready", ready)
+
+    @on.llm_response(priority=Priority.LOW)
+    async def process_stickers(self, event: KiraMessageBatchEvent, resp: LLMResponse):
         if not self.sticker_control_enabled:
             return
-        if not message_chains:
+        if resp.status == "error":
             return
-
-        # 1. 过滤掉只有 Reply 的消息链
-        filtered_chains = []
-        for chain in message_chains:
-            if len(chain) == 1 and isinstance(chain[0], Reply):
-                logger.debug(f"丢弃只有引用的消息块: {chain[0]}")
-                continue
-            filtered_chains.append(chain)
-        message_chains[:] = filtered_chains
-
-        if not message_chains:
+        rewritten = _sticker_rewrite_xml(
+            resp.text_response,
+            self.sticker_probability,
+            self.random_position,
+            sticker_enabled=getattr(event, "_sticker_tag_ready", False),
+            valid_sticker_ids=self._sticker_ids(),
+        )
+        if rewritten is None:
+            # 没有表情、无需过滤，或 XML 无法安全改写：保持原文不动
             return
+        logger.debug(f"Sticker 处理完成，改写后的消息块数量: {rewritten.count('<msg')}")
+        resp.text_response = rewritten
 
-        # 2. 处理 sticker
-        sticker_chains = []
-        new_chains = []
-
-        for chain in message_chains:
-            elements = chain.message_list
-            # 找出所有表情的位置
-            sticker_indices = [i for i, e in enumerate(elements) if isinstance(e, Sticker)]
-
-            if not sticker_indices:
-                # 没有表情，直接保留原链
-                new_chains.append(chain)
-                continue
-
-            # 1. 按概率决定哪些表情保留
-            keep_indices = []
-            for idx in sticker_indices:
-                if random.random() < self.sticker_probability:
-                    keep_indices.append(idx)
-                else:
-                    logger.debug(f"删除 sticker: {elements[idx]}")
-
-            # 2. 原链中移除所有表情（无论是否保留），剩下的元素组成一个新链
-            remaining_elements = [e for i, e in enumerate(elements) if i not in sticker_indices]
-
-            # 3. 处理剩余链：如果它只包含一个 Reply（即空引用），则丢弃；否则加入
-            if remaining_elements:
-                if len(remaining_elements) == 1 and isinstance(remaining_elements[0], Reply):
-                    logger.debug(f"丢弃只有引用的消息块: {remaining_elements[0]}")
-                else:
-                    new_chains.append(MessageChain(remaining_elements))
-
-            # 4. 每个保留的表情单独成为一个消息链（独立成行）
-            for idx in keep_indices:
-                new_chains.append(MessageChain([elements[idx]]))
-
-        # 5. 随机调整表情链的位置（如果启用）
-        if self.random_position:
-            # 分离出表情链和非表情链
-            non_sticker_chains = [c for c in new_chains if not (len(c.message_list) == 1 and isinstance(c.message_list[0], Sticker))]
-            sticker_chains = [c for c in new_chains if len(c.message_list) == 1 and isinstance(c.message_list[0], Sticker)]
-            new_chains = non_sticker_chains.copy()
-            for sc in sticker_chains:
-                pos = random.randint(0, len(new_chains))
-                new_chains.insert(pos, sc)
-        # 如果未启用随机位置，表情链会按顺序放在最后（默认行为）
-
-        message_chains.clear()
-        message_chains.extend(new_chains)
-        logger.debug(f"Sticker 处理完成，消息块数量: {len(message_chains)}")
-
+    def _sticker_ids(self):
+        """当前可用的 sticker id 集合；拿不到时返回 None（不做校验）。"""
+        try:
+            sticker_mgr = getattr(self.ctx, "sticker_mgr", None)
+            if sticker_mgr is None:
+                return None
+            return set(sticker_mgr.sticker_dict)
+        except Exception:
+            return None
     # ---------- Typing Indicator 功能 ----------
     async def _send_typing(self, session: Session, log: bool = True):
         if not self.typing_indicator_enabled:
