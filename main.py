@@ -96,6 +96,12 @@ def _sticker_is_sticker_only(node) -> bool:
     return node.tag == _STICKER_MSG and [n.tag for n in node] == [_STICKER_TAG]
 
 
+def _sticker_order(root) -> list:
+    """消息的顺序签名，用于判断一次重排是否真的改变了位置。"""
+    return [(n.tag, (n.text or "").strip() or (n[0].text or "").strip() if len(n) else "")
+            for n in root]
+
+
 def _sticker_signature(root) -> list:
     """整棵树的可比较签名，用于改写后的语义自检。"""
     return [
@@ -158,6 +164,8 @@ def _sticker_rewrite_xml(xml_data, probability, random_position, rng=None,
 
     rng = rng or random
     changed = False
+    # 内容不需要改动、但仍要参与重排时置位（否则 random_position 会被跳过）
+    shuffle_only = False
 
     for msg in list(root):
         if msg.tag != _STICKER_MSG or not list(msg):
@@ -179,8 +187,12 @@ def _sticker_rewrite_xml(xml_data, probability, random_position, rng=None,
             kept = [n for n in stickers if rng.random() < probability]
             rest = [n for n in _sticker_effective_children(msg) if n.tag != _STICKER_TAG]
 
-            # 单表情、被保留、且没有其他内容：本来就是独立一条，无需改动
-            if not (len(stickers) == 1 and kept and not rest):
+            # 单表情、被保留、且没有其他内容：内容无需改动，
+            # 但 random_position 仍要生效——它本来就是独立一条，
+            # 需要在后面的重排里参与位置随机，不能在这里提前退出。
+            if len(stickers) == 1 and kept and not rest:
+                shuffle_only = True
+            else:
                 changed = True
                 # 原链中移除所有表情（无论是否保留）
                 for node in stickers:
@@ -211,7 +223,7 @@ def _sticker_rewrite_xml(xml_data, probability, random_position, rng=None,
                 _sticker_detach_from_root(root, msg)
                 changed = True
 
-    if not changed:
+    if not changed and not (random_position and shuffle_only):
         return None
 
     # 清理解析后不会产生任何消息元素的消息块（空 <msg/>、只剩空白 <text> 的、
@@ -223,7 +235,11 @@ def _sticker_rewrite_xml(xml_data, probability, random_position, rng=None,
             _sticker_detach_from_root(root, msg)
 
     if random_position:
+        before = _sticker_order(root)
         _sticker_shuffle(root, rng)
+        # 纯重排路径下如果顺序没变（只有一个候选位置等），保持原文不动
+        if not changed and _sticker_order(root) == before:
+            return None
 
     # 消息全被过滤掉、且没有根标签（动作）要执行时，返回空响应。
     # 保持空字符串而不是 <msg/>：既不会发送任何气泡，也不会被其他插件的
